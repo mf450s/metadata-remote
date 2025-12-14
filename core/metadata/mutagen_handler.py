@@ -75,6 +75,51 @@ class FieldNameMapper:
             return field_id[22:]  # Remove '----:com.apple.iTunes:' prefix
         return field_id
 
+    # Multi-Value Unterstützung
+    MULTI_VALUE_FIELDS = {'artist', 'genre', 'composer', 'albumartist'}
+    MULTI_VALUE_SEPARATOR = '; '  # Semikolon mit Leerzeichen
+    def parse_multi_value(value, field_name=None):
+        """Parse einen Wert in eine Liste von Einzelwerten."""
+        if not value:
+            return []
+        
+        if isinstance(value, list):
+            result = []
+            for v in value:
+                if isinstance(v, str) and '; ' in v:
+                    result.extend([x.strip() for x in v.split(';') if x.strip()])
+                else:
+                    result.append(str(v).strip() if v else '')
+            return [v for v in result if v]
+        
+        value_str = str(value)
+        
+        # Semikolon-Trennung
+        if ';' in value_str:
+            return [v.strip() for v in value_str.split(';') if v.strip()]
+        
+        # Null-Byte-Trennung (ID3v2.4)
+        if '\x00' in value_str:
+            return [v.strip() for v in value_str.split('\x00') if v.strip()]
+        
+        return [value_str.strip()] if value_str.strip() else []
+    
+    
+    def join_multi_value(values):
+        """Verbindet mehrere Werte zu einem String."""
+        if not values:
+            return ''
+        
+        if isinstance(values, str):
+            return values
+        
+        return '; '.join(str(v).strip() for v in values if v)
+    
+    
+    def should_use_multi_value(field_name):
+        """Prüft, ob ein Feld Multi-Value-Unterstützung haben sollte."""
+        return field_name.lower() in MULTI_VALUE_FIELDS
+
 
 class MutagenHandler:
     """Centralized handler for all Mutagen operations"""
@@ -583,67 +628,91 @@ class MutagenHandler:
         
         # Special handling for different formats
         if isinstance(audio_file, MP3):
-            # MP3 uses ID3 tags
             for field, tag_name in tag_map.items():
                 if tag_name in audio_file:
-                    value = str(audio_file[tag_name][0]) if audio_file[tag_name] else ''
-                    metadata[field] = value
+                    frame = audio_file[tag_name]
+                    
+                    # Multi-Value-Felder
+                    if should_use_multi_value(field) and hasattr(frame, 'text'):
+                        values = [str(t) for t in frame.text if t]
+                        metadata[field] = join_multi_value(values)
+                    # Normale Felder
+                    elif hasattr(frame, 'text'):
+                        metadata[field] = str(frame.text[0]) if frame.text else ''
+                    else:
+                        metadata[field] = str(frame[0]) if frame else ''
         
         elif isinstance(audio_file, (OggVorbis, OggOpus, FLAC)):
-            # These use Vorbis comments
             for field, tag_name in tag_map.items():
                 if format_type == 'flac':
-                    # FLAC uses lowercase
                     tag_name = tag_name.lower()
+                
                 if tag_name in audio_file:
                     value = audio_file[tag_name]
-                    # Vorbis comments can be lists
+                    
                     if isinstance(value, list):
-                        value = value[0] if value else ''
-                    metadata[field] = str(value)
+                        if should_use_multi_value(field):
+                            metadata[field] = join_multi_value(value)
+                        else:
+                            metadata[field] = str(value[0]) if value else ''
+                    else:
+                        metadata[field] = str(value)
         
         elif isinstance(audio_file, MP4):
-            # MP4 uses atoms
             for field, atom in tag_map.items():
                 if atom in audio_file:
                     value = audio_file[atom]
+                    
                     if isinstance(value, list):
-                        value = value[0]
-                    # Special handling for track/disc tuples
-                    if field in ['track', 'disc'] and isinstance(value, tuple):
-                        value = str(value[0]) if value[0] else ''
-                    metadata[field] = str(value)
-        
+                        if should_use_multi_value(field):
+                            text_values = [v for v in value if not isinstance(v, tuple)]
+                            metadata[field] = join_multi_value(text_values) if text_values else ''
+                        elif value:
+                            first_val = value[0]
+                            if isinstance(first_val, tuple):
+                                metadata[field] = str(first_val[0]) if first_val[0] else ''
+                            else:
+                                metadata[field] = str(first_val)
+                
         elif isinstance(audio_file, ASF):
-            # WMA/ASF
             for field, tag_name in tag_map.items():
                 if tag_name in audio_file:
                     value = audio_file[tag_name]
+                    
                     if isinstance(value, list):
-                        value = value[0]
-                    metadata[field] = str(value.value) if hasattr(value, 'value') else str(value)
+                        if should_use_multi_value(field):
+                            text_values = [str(v.value) if hasattr(v, 'value') else str(v) for v in value]
+                            metadata[field] = join_multi_value(text_values)
+                        elif value:
+                            v = value[0]
+                            metadata[field] = str(v.value) if hasattr(v, 'value') else str(v)
         
         elif isinstance(audio_file, WAVE):
-            # WAV uses ID3 tags in Mutagen
             if hasattr(audio_file, 'tags') and audio_file.tags:
                 for field, tag_name in tag_map.items():
                     if tag_name in audio_file.tags:
                         tag = audio_file.tags[tag_name]
-                        if hasattr(tag, 'text'):
-                            # ID3 text frames
+                        
+                        if should_use_multi_value(field) and hasattr(tag, 'text'):
+                            values = [str(t) for t in tag.text if t]
+                            metadata[field] = join_multi_value(values)
+                        elif hasattr(tag, 'text'):
                             metadata[field] = str(tag.text[0]) if tag.text else ''
                         else:
                             metadata[field] = str(tag[0]) if tag else ''
         
         elif isinstance(audio_file, WavPack):
-            # WavPack uses APEv2 tags
             for field, tag_name in tag_map.items():
                 if tag_name in audio_file:
                     value = audio_file[tag_name]
-                    # APEv2 tags can be lists
+                    
                     if isinstance(value, list):
-                        value = value[0] if value else ''
-                    metadata[field] = str(value)
+                        if should_use_multi_value(field):
+                            metadata[field] = join_multi_value(value)
+                        else:
+                            metadata[field] = str(value[0]) if value else ''
+                    else:
+                        metadata[field] = str(value)
         
         # Normalize single spaces to empty strings for UI display
         normalized_metadata = {}
